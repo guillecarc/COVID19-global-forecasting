@@ -1,0 +1,250 @@
+---
+title: "COVID 19 Global Forecasting"
+output:
+  html_document:
+    code_folding: hide
+    fig_caption: yes
+    fig_height: 6
+    fig_width: 10
+    number_sections: yes
+    theme: readable
+    toc: yes
+    toc_float:
+      collapse: yes
+---
+
+```{r Libraries and parameters, include = FALSE}
+library(tidyverse)
+library(DT)
+library(RcppRoll)
+library(scales)
+source("./R/merge_data_sources.R")
+```
+
+```{r Load training data, include = FALSE}
+df <- get_data(complete.cases = FALSE)
+train_df <- df %>% 
+  filter(data_type == "train")
+```
+
+# Data structure  
+```{r Glimpse the data}
+datatable(head(train_df),
+          extensions = c('Scroller', "Buttons"),
+          options = list(
+            dom = 'Bfrtip',
+            scrollX = T,
+            scrollY = "400px",
+            buttons = list(
+              list(
+                extend = 'excel'
+              ))))
+```
+
+# Most impacted countries  
+```{r KPI per country}
+KPICountry <- train_df %>% 
+  group_by(Country_Region, Province_State) %>% 
+  summarise(ConfirmedCases = max(ConfirmedCases),
+            Fatalities = max(Fatalities)) %>% 
+  ungroup() %>% 
+  group_by(Country_Region) %>% 
+  summarise(ConfirmedCases = sum(ConfirmedCases),
+            Fatalities = sum(Fatalities)) %>% 
+  arrange(desc(ConfirmedCases)) %>% 
+  ungroup() %>% 
+  mutate(FatalityRate = round(Fatalities / ConfirmedCases * 100, 2),
+         ConfirmedCasesRel = round(ConfirmedCases / sum(ConfirmedCases) * 100, 2),
+         FatalitiesRel = round(Fatalities / sum(Fatalities) * 100, 2))
+
+DailyGrowthCountry <- train_df %>% 
+  group_by(Date, Country_Region, Province_State) %>% 
+  summarise(ConfirmedCases = max(ConfirmedCases),
+            Fatalities = max(Fatalities)) %>% 
+  ungroup() %>% 
+  group_by(Date, Country_Region) %>% 
+  summarise(ConfirmedCases = sum(ConfirmedCases),
+            Fatalities = sum(Fatalities)) %>% 
+  ungroup() %>% 
+  group_by(Country_Region) %>%
+  mutate(DateDiff = as.numeric(Date - lag(Date)),
+         ConfirmCasesDiff = ConfirmedCases - lag(ConfirmedCases),
+         ConfirmRate = ConfirmCasesDiff / DateDiff / ConfirmedCases * 100,
+         FatalitDiff = Fatalities - lag(Fatalities),
+         FatalitRate = FatalitDiff / DateDiff / Fatalities * 100,
+         ConfirmRateSmt = roll_mean(ConfirmRate, n = 7,fill = NA, align = "right"),
+         FatalitRateSmt = roll_mean(FatalitRate, n = 7,fill = NA, align = "right")) %>% 
+  ungroup()
+
+AvgDailyGrowthCountry <- DailyGrowthCountry %>% 
+  group_by(Country_Region) %>% 
+  summarise(ConfirmGthAvgRate = round(mean(ConfirmRate, na.rm = TRUE), 2),
+            FatalitGthAvgRate = round(mean(FatalitRate, na.rm = TRUE)))
+
+DailyGrowthCountry$ConfirmRate[is.na(DailyGrowthCountry$ConfirmRate)] <- 0
+DailyGrowthCountry$FatalitRate[is.na(DailyGrowthCountry$FatalitRate)] <- 0
+DailyGrowthCountry$ConfirmRateSmt[is.na(DailyGrowthCountry$ConfirmRateSmt)] <- 0
+DailyGrowthCountry$FatalitRateSmt[is.na(DailyGrowthCountry$FatalitRateSmt)] <- 0
+
+KPICountry %>% 
+  left_join(AvgDailyGrowthCountry,
+            by = "Country_Region") %>% 
+  datatable(extensions = c('Scroller', "Buttons"),
+            options = list(
+              dom = 'Bfrtip',
+              scrollX = T,
+              scrollY = "400px",
+              buttons = list(
+                list(
+                  extend = 'excel'
+                ))))
+```
+
+## Confirmed cases and fatalities evolution  
+
+```{r Confirmed cases per country - top 10}
+TopCountries <- KPICountry %>% 
+  arrange(desc(ConfirmedCases)) %>% 
+  top_n(10, wt = ConfirmedCases) %>% 
+  select(Country_Region) %>% 
+  pull
+```
++ The top 10 countries with most confirmed cases are: **`r paste(TopCountries, collapse = ", ")`**.
++ United States seems to be growing faster than the rest of the countries in amount of confirmed cases.  
++ On the other side, the smoothed growth rate suggest that the incremental factor is still comparable to the rest of the countres, which indicates it may not be useful enought to analyze countries by the absolute number of cases as they vary in population density.  
++ Besides, the different starting dates difficults the comparison between countries. Hence, the evolution from day zero per country might be a better approach.
+```{r Evolution per country}
+DailyGrowthCountry %>% 
+  group_by(Country_Region) %>% 
+  filter(Country_Region %in% TopCountries) %>% 
+  ungroup %>% 
+  mutate(Country_Region = fct_reorder(.f = Country_Region, .x = ConfirmedCases, .fun = 'max', .desc = TRUE)) %>% 
+  pivot_longer(cols = c(ConfirmRateSmt, FatalitRateSmt, ConfirmedCases, Fatalities), names_to = "metric", values_to = "value") %>% 
+  ggplot(aes(x = Date, y = value, color = Country_Region, group = Country_Region)) +
+  geom_line() +
+  facet_grid(metric~., scales = "free") +
+  ggtitle("Evolution over time - Top 10") +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank())
+```
+
+## Country comparison from day 0  
++ It is interesting how different the fatalities evolved per country, giving almost the visual sense of clusters. While the earliest countries in report deads were **US**, **Iran** and **China**. The latest were **Germany**, **United Kingdom** and **Belgium**.
+```{r Country comparison from day 0}
+DayZero <- DailyGrowthCountry %>% 
+  group_by(Country_Region) %>% 
+  filter(ConfirmedCases > 0) %>% 
+  summarise(min = min(Date)) %>% 
+  ungroup()
+
+DailyGrowthCountry %>% 
+  left_join(DayZero,
+            by = "Country_Region") %>% 
+  filter(Date >= min) %>% 
+  mutate(day = Date - min) %>% 
+  filter(Country_Region %in% TopCountries) %>% 
+  ungroup %>% 
+  mutate(Country_Region = fct_reorder(.f = Country_Region, .x = ConfirmedCases, .fun = 'max', .desc = TRUE)) %>% 
+  pivot_longer(cols = c(ConfirmRateSmt, FatalitRateSmt, ConfirmedCases, Fatalities), names_to = "metric", values_to = "value") %>% 
+  ggplot(aes(x = day, y = value, color = Country_Region, group = Country_Region)) +
+  geom_line() +
+  facet_grid(metric~., scales = "free") +
+  scale_x_continuous() +
+  ggtitle("Evolution over time from day zero - Top 10") +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank())
+```
+
+## Contagions per million of inhabitants
+
+```{r Contagions per million of inhabitants}
+temp <- train_df %>% 
+  filter(!is.na(UN__median_age)) %>% 
+  group_by(Date, Country_Region, Province_State) %>% 
+  summarise(ConfirmedCases = max(ConfirmedCases),
+            Fatalities = max(Fatalities),
+            Wiki__pop = mean(Wiki__pop),
+            Wiki__area = Wiki__pop / mean(Wiki__density)) %>% 
+  ungroup() %>% 
+  group_by(Date, Country_Region) %>% 
+  summarise(ConfirmedCases = sum(ConfirmedCases),
+            Fatalities = sum(Fatalities),
+            Wiki__pop = mean(Wiki__pop),
+            Wiki__area = mean(Wiki__area),
+            ConfirmedCasesPerMillion = ConfirmedCases / Wiki__pop / 1000000,
+            ContagionsDensity = ConfirmedCases / Wiki__area) %>% 
+  ungroup()
+
+TopCountries <- temp %>% 
+  filter(ConfirmedCasesPerMillion != 0) %>% 
+  group_by(Country_Region) %>% 
+  summarise(ConfirmedCasesPerMillion = max(ConfirmedCasesPerMillion)) %>% 
+  arrange(desc(ConfirmedCasesPerMillion)) %>% 
+  top_n(10, wt = ConfirmedCasesPerMillion) %>% 
+  select(Country_Region) %>% 
+  pull
+```
++ Now if we compare the top 10 countries with more cases per million of inhabitants, the scenario is different: **`r paste(TopCountries, collapse = ", ")`**.  
++ US went from the **1st** place to the **10th**.  
+```{r Contagions per million of inhabitants - Top 10 Countries}
+temp %>% 
+  left_join(DayZero,
+            by = "Country_Region") %>% 
+  filter(Date >= min) %>% 
+  mutate(day = Date - min) %>% 
+  filter(Country_Region %in% TopCountries) %>% 
+  ungroup %>% 
+  mutate(Country_Region = fct_reorder(.f = Country_Region, .x = ConfirmedCasesPerMillion, .fun = 'max', .desc = TRUE)) %>% 
+  pivot_longer(cols = c(ConfirmedCasesPerMillion), names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = day, y = value, color = Country_Region, group = Country_Region)) +
+  geom_line() +
+  scale_x_continuous() +
+  ggtitle("Evolution over time from day zero - Top 10") +
+  geom_text(data = . %>% group_by(Country_Region) %>% summarise(max_value = max(value), max_day = max(day)), aes(label = Country_Region, x = max_day, y = max_value), hjust = "inward") +
+  theme(legend.position = "none") +
+  ylab("Contagions per million of inhabitants")
+```
+  
+## Contagions density
+```{r Contagions density}
+TopCountries <- temp %>% 
+  filter(ContagionsDensity != 0) %>% 
+  group_by(Country_Region) %>% 
+  summarise(ContagionsDensity = max(ContagionsDensity)) %>% 
+  arrange(desc(ContagionsDensity)) %>% 
+  top_n(10, wt = ContagionsDensity) %>%
+  select(Country_Region) %>% 
+  pull
+```
+  
++ Lets check now the density of contagions, as the size of the geographic area also play its part in the contagion speed.  
++ Again the top changed having: **`r paste(TopCountries, collapse = ", ")`**.  
++ US is not even in the ranking.  
+```{r Contagions density - Top 10 Countries}
+temp %>% 
+  left_join(DayZero,
+            by = "Country_Region") %>% 
+  filter(Date >= min) %>% 
+  mutate(day = Date - min) %>% 
+  filter(Country_Region %in% TopCountries) %>% 
+  ungroup %>% 
+  mutate(Country_Region = fct_reorder(.f = Country_Region, .x = ContagionsDensity, .fun = 'max', .desc = TRUE)) %>% 
+  pivot_longer(cols = c(ContagionsDensity), names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = day, y = value, color = Country_Region, group = Country_Region)) +
+  geom_line() +
+  scale_x_continuous() +
+  ggtitle("Evolution over time from day zero - Top 10") +
+  geom_text(data = . %>% group_by(Country_Region) %>% summarise(max_value = max(value), max_day = max(day)), aes(label = Country_Region, x = max_day, y = max_value), hjust = "inward") +
+  theme(legend.position = "none") +
+  ylab("Contagions Density - Top 10")
+```
+
+# Correlations  
+## Prosperity Index
+```{r}
+temp %>% 
+  select(ConfirmedCasesPerMillion)
+```
+
